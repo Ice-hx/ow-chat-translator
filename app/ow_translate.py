@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-守望聊天翻译器 v2（双向 · 全局热键 · CUDA 加速）
+守望聊天翻译器 v3（多语种 · 双向 · 全局热键 · CUDA 加速）
 ------------------------------------------------------
-· OCR  ：RapidOCR 韩语模型（自动放大，解决小字号）
+支持：韩语 / 英语 / 日语 ↔ 中文
+· OCR  ：RapidOCR，按语言切换识别模型（ko / en / ja / 中日英混合）
 · 翻译  ：llama.cpp + Qwen2.5（优先 7B，有显卡走 CUDA）
-· 方向  ：韩→中 / 中→韩，可自动判断
-· 热键  ：F8 截取预设区域并翻译（可改）
+· 方向  ：源语言可自动检测；中文输入时可指定译成韩/英/日
+· 热键  ：F8 截取预设区域并翻译
 """
 from __future__ import annotations
 
@@ -37,54 +38,162 @@ CONFIG_PATH = ROOT / 'config.json'
 PORT = 18080
 BASE_URL = f'http://127.0.0.1:{PORT}'
 
-KO2ZH = """你是《守望先锋》韩服聊天的翻译器，把韩语翻成简体中文。
-
-固定译法（必须遵守）：
-힐=治疗  궁=大招  겐지=源氏  겐지새끼=源氏那家伙
-뒤=后面  조심=小心  제발=拜托   ㅅㅂ=操  ㅈㅈ=GG
-죽었=死了  살려=救我  물러=后撤  가자=上  힐러=奶妈
-
-规则：
-1. 只输出中文译文，不解释、不加引号、不音译
-2. 保留原句语气：骂人就翻译成骂人，催促就翻成催促
-3. 原文很短就直接短译，不要扩写成完整句子
-4. 不确定的英雄名按常见译名处理"""
-
-ZH2KO = """你是《守望先锋》韩服聊天的翻译器，把简体中文翻成自然的韩语口语。
-
-固定译法（必须遵守）：
-治疗=힐  大招=궁  源氏=겐지  后面=뒤  小心=조심
-拜托=제발  操=ㅅㅂ  GG=ㅈㅈ  救我=살려  后撤=물러  上=가자
-没血=피 없어  血量=체력  血=피  别送了=그만 죽어  送=죽다
-集合=모여  跟我来=따라와  打得好=잘했어  谢谢=고마워
-
-规则：
-1. 只输出韩语译文，不解释、不加引号、不加路径或标签
-2. 用游戏里真实会说的短句，不要书面语
-3. 保留语气强度：骂人就翻成骂人，催促就翻成催促
-4. 韩语要自然，不要逐字直译"""
-
-SHOTS_KO2ZH = [
-    ('힐 좀 줘', '给点治疗'),
-    ('궁 써라 지금', '现在放大招'),
-    ('뒤에 겐지 있어', '后面有源氏'),
-    ('ㅅㅂ 또 죽었네', '操，又死了'),
-    ('제발 조심해', '拜托小心点'),
-]
-
-SHOTS_ZH2KO = [
-    ('给点治疗', '힐 좀 줘'),
-    ('现在放大招', '지금 궁 써'),
-    ('后面有源氏', '뒤에 겐지 있어'),
-    ('操，又死了', 'ㅅㅂ 또 죽었네'),
-    ('后撤', '물러'),
-]
+# ---------------------------------------------------------------- 语言
+LANGS = {'zh': '中文', 'ko': '韩语', 'en': '英语', 'ja': '日语'}
+SRC_CHOICES = [('自动', 'auto'), ('中文', 'zh'), ('韩语', 'ko'), ('英语', 'en'), ('日语', 'ja')]
+TGT_CHOICES = [('中文', 'zh'), ('韩语', 'ko'), ('英语', 'en'), ('日语', 'ja')]
 
 HANGUL = re.compile(r'[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]')
+KANA = re.compile(r'[\u3040-\u30FF]')
+CJK = re.compile(r'[\u4E00-\u9FFF]')
+LATIN = re.compile(r'[A-Za-z]')
+
+
+def detect_lang(text: str) -> str:
+    """按字符集猜源语言。中文/日文都有汉字，所以先看假名再看韩文。"""
+    if HANGUL.search(text):
+        return 'ko'
+    if KANA.search(text):
+        return 'ja'
+    if CJK.search(text):
+        return 'zh'
+    if LATIN.search(text):
+        return 'en'
+    return 'zh'
+
+
+def _hangul_ratio(text: str) -> float:
+    """非空白字符里韩文占多大比例。用于 auto 模式排除误识别的乱码。"""
+    total = sum(1 for c in text if not c.isspace())
+    if not total:
+        return 0.0
+    return len(HANGUL.findall(text)) / total
+
+
+# ---------------------------------------------------------------- 提示词
+RULE_TAIL = """
+规则：
+1. 只输出译文，不解释、不加引号、不加语言标签
+2. 保留原句语气：骂人就翻译成骂人，催促就翻成催促
+3. 原文很短就直接短译，不要扩写成完整句子
+4. 英雄名用中文常见译名（源氏、半藏、天使、禅雅塔、查莉娅…）"""
+
+PROMPTS: dict[tuple[str, str], tuple[str, list[tuple[str, str]]]] = {
+    ('ko', 'zh'): (
+        """你是《守望先锋》韩服聊天的翻译器，把韩语翻成简体中文。
+
+固定译法（必须遵守）：
+힐=治疗  궁=大招  겐지=源氏  뒤=后面  조심=小心
+제발=拜托  ㅅㅂ=操  ㅈㅈ=GG  살려=救我  물러=后撤  가자=上
+""" + RULE_TAIL,
+        [
+            ('힐 좀 줘', '给点治疗'),
+            ('궁 써라 지금', '现在放大招'),
+            ('뒤에 겐지 있어', '后面有源氏'),
+            ('ㅅㅂ 또 죽었네', '操，又死了'),
+            ('제발 조심해', '拜托小心点'),
+        ],
+    ),
+    ('en', 'zh'): (
+        """你是《守望先锋》聊天翻译器，把英语游戏聊天翻成简体中文。
+
+固定译法（必须遵守）：
+heal / heals = 治疗   ult / ultimate = 大招   Genji = 源氏
+behind = 后面   careful = 小心   push = 上   retreat / back = 后撤
+gg = GG   no heals = 没治疗   feed / feeding = 送
+
+缩写与黑话（必须按这个译）：
+wp = 打得漂亮   ns / nice shot = 好枪   ez = 轻松
+diff = 差距（tank diff = 坦克差距，heal diff = 治疗差距）
+c9 = 重大失误   peel = 掩护   on me = 跟我
+one hp = 一枪血   rez = 复活   shatter = 裂地猛击
+grav = 重力喷涌   nano = 纳米激素   blade = 拔刀
+throw = 演 / 故意送   afk = 挂机   brb = 马上回来
+stagger = 逐个击杀 / 拖延   contest = 占点   smurf = 小号
+shotcall = 指挥   poke = 消耗   dive = 突进   bait = 骗
+incoming = 要来了
+""" + RULE_TAIL,
+        [
+            ('heal me', '给我治疗'),
+            ('ult now', '现在放大招'),
+            ('Genji behind', '源氏在后面'),
+            ('ns', '好枪'),
+            ('peel for me', '掩护我'),
+            ('tank diff', '坦克差距'),
+            ('throw', '演'),
+        ],
+    ),
+    ('ja', 'zh'): (
+        """你是《守望先锋》聊天翻译器，把日语游戏聊天翻成简体中文。
+
+固定译法（必须遵守）：
+ヒール = 治疗   ウルト / アルティメット = 大招   ゲンジ = 源氏
+後ろ = 后面   注意 = 小心   押し = 上   撤退 = 后撤
+gg = GG   回復 = 治疗   無理 = 打不过
+""" + RULE_TAIL,
+        [
+            ('ヒールください', '请给治疗'),
+            ('ウルト使って', '放大招'),
+            ('後ろにゲンジ', '后面有源氏'),
+            ('押しに行くぞ', '上'),
+            ('gg', 'GG'),
+        ],
+    ),
+    ('zh', 'ko'): (
+        """你是《守望先锋》韩服聊天的翻译器，把简体中文翻成自然的韩语口语。
+
+固定译法（必须遵守）：
+治疗=힐  大招=궁  源氏=겐지  后面=뒤  小心=조심  拜托=제발
+操=ㅅㅂ  GG=ㅈㅈ  救我=살려  后撤=물러  上=가자
+没血=피 없어  血量=체력  别送了=그만 죽어  集合=모여  打得好=잘했어
+""" + RULE_TAIL.replace('英雄名用中文常见译名（源氏、半藏、天使、禅雅塔、查莉娅…）',
+                         '英雄名用韩语常见写法（겐지、한조、메르시、젠야타、자리야…）'),
+        [
+            ('给点治疗', '힐 좀 줘'),
+            ('现在放大招', '지금 궁 써'),
+            ('后面有源氏', '뒤에 겐지 있어'),
+            ('操，又死了', 'ㅅㅂ 또 죽었네'),
+            ('后撤', '물러'),
+        ],
+    ),
+    ('zh', 'en'): (
+        """你是《守望先锋》聊天的翻译器，把简体中文翻成地道的英语游戏口语。
+
+固定译法（必须遵守）：
+治疗=heals  大招=ult  源氏=Genji  后面=behind  小心=careful
+上=push  后撤=retreat  救我=help me  别送了=stop feeding
+没血=I'm low  血量=HP  残血=low HP
+""" + RULE_TAIL.replace('英雄名用中文常见译名（源氏、半藏、天使、禅雅塔、查莉娅…）',
+                         '英雄名用英文名（Genji、Hanzo、Mercy、Zenyatta、Zarya…）'),
+        [
+            ('给点治疗', 'heals please'),
+            ('现在放大招', 'ult now'),
+            ('后面有源氏', 'Genji behind'),
+            ('操，又死了', 'ffs, dead again'),
+            ('后撤', 'fall back'),
+        ],
+    ),
+    ('zh', 'ja'): (
+        """你是《守望先锋》聊天的翻译器，把简体中文翻成自然的日语游戏口语。
+
+固定译法（必须遵守）：
+治疗=ヒール  大招=ウルト  源氏=ゲンジ  后面=後ろ  小心=注意
+上=押し  后撤=撤退  救我=助けて  别送了=死にすぎ
+""" + RULE_TAIL.replace('英雄名用中文常见译名（源氏、半藏、天使、禅雅塔、查莉娅…）',
+                         '英雄名用日语片假名写法（ゲンジ、ハンゾー、マーシー、ゼニヤッタ、ザリア…）'),
+        [
+            ('给点治疗', 'ヒールください'),
+            ('现在放大招', 'ウルト使って'),
+            ('后面有源氏', '後ろにゲンジ'),
+            ('操，又死了', 'くそ、また死んだ'),
+            ('后撤', '撤退'),
+        ],
+    ),
+}
 
 # 中→韩 的兜底短语表：模型偶尔吐出非韩文（实测出现过 "hế수"），命中就整句替换
 ZH_FALLBACK = {
-    '别送了': '그만 죽어', '别送': '그만 죽어', '别送了。': '그만 죽어',
+    '别送了': '그만 죽어', '别送': '그만 죽어',
     '集合': '모여', '跟我来': '따라와', '打得好': '잘했어',
     '谢谢': '고마워', '对不起': '미안', '上': '가자', '退': '물러',
     '给点治疗': '힐 좀 줘', '放大招': '궁 써', '开大': '궁 써',
@@ -92,12 +201,35 @@ ZH_FALLBACK = {
     '后面有人': '뒤에 있어', '小心': '조심해', '救我': '살려줘',
 }
 
+# 英→中 的缩写/黑话兜底：短句整句命中就直接返回，别让模型猜
+EN_FALLBACK = {
+    'gg': 'GG', 'wp': '打得漂亮', 'gg wp': 'GG，打得漂亮', 'ez': '轻松',
+    'ns': '好枪', 'nice shot': '好枪', 'diff': '差距',
+    'tank diff': '坦克差距', 'heal diff': '治疗差距', 'dps diff': '输出差距',
+    'c9': '重大失误', 'peel': '掩护', 'peel for me': '掩护我',
+    'on me': '跟我', 'one hp': '一枪血', '1 hp': '一枪血',
+    'rez': '复活', 'rez me': '复活我', 'shatter': '裂地猛击',
+    'grav': '重力喷涌', 'nano': '纳米激素', 'blade': '拔刀',
+    'throw': '演', 'throwing': '在演', 'afk': '挂机', 'brb': '马上回来',
+    'stagger': '逐个击杀', 'contest': '占点', 'contest point': '占点',
+    'smurf': '小号', 'ffs': '靠', 'omg': '天啊', 'push': '上',
+    'fall back': '后撤', 'regroup': '集合', 'group up': '集合',
+    'ult': '大招', 'ult economy': '大招运营',
+    'shotcall': '指挥', 'shotcalling': '指挥',
+    'incoming': '要来了', 'nano blade incoming': '纳米激素拔刀要来了',
+    'nano blade': '纳米拔刀', 'blade incoming': '拔刀要来了',
+}
+
+
+def _norm(text: str) -> str:
+    return text.strip().lower().rstrip('。！!？?.')
+
 
 def clean_output(text: str) -> str:
     """模型偶尔会带路径前缀、引号或“译文：”，统一清掉。"""
     t = (text or '').strip()
     t = re.sub(r'^/[A-Za-z0-9_]+/\s*', '', t)
-    t = re.sub(r'^(译文|翻译|韩语|中文|结果)\s*[:：]\s*', '', t)
+    t = re.sub(r'^(译文|翻译|韩语|中文|英语|日语|结果)\s*[:：]\s*', '', t)
     t = t.strip().strip('"').strip('“').strip('”').strip("'").strip()
     return t
 
@@ -105,7 +237,9 @@ def clean_output(text: str) -> str:
 # ---------------------------------------------------------------- 配置
 def load_config() -> dict:
     cfg = {
-        'direction': 'auto',      # auto | ko2zh | zh2ko
+        'src': 'auto',            # auto | zh | ko | en | ja
+        'tgt': 'zh',              # zh | ko | en | ja
+        'zh_target': 'ko',        # 输入是中文时，默认译成哪种语言
         'region': None,           # [left, top, right, bottom]
         'hotkey': 'F8',
         'model': 'auto',          # auto | 7b | 3b
@@ -134,7 +268,6 @@ class Translator:
         self.mode = ''
         self._lock = threading.Lock()
 
-    # -- 选择运行时与模型 ------------------------------------------------
     def _pick_runtime(self) -> tuple[Path, bool]:
         cuda = ROOT / 'runtime' / 'llama-cuda'
         cpu = ROOT / 'runtime' / 'llama'
@@ -145,7 +278,6 @@ class Translator:
     def _pick_model(self) -> Path | None:
         models = ROOT / 'models'
         prefer = self.cfg.get('model', 'auto')
-        # 7B 的 Q4_K_M 在 ModelScope 上是分片的，传第一个分片即可，llama.cpp 会自动找后续分片
         b7 = models / 'qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf'
         if not b7.exists():
             b7 = models / 'qwen2.5-7b-instruct-q4_k_m.gguf'
@@ -160,7 +292,6 @@ class Translator:
             return b3
         return None
 
-    # -- 启动 ------------------------------------------------------------
     def ensure_server(self, on_log=None) -> bool:
         with self._lock:
             if self.ready and self._ping():
@@ -216,21 +347,25 @@ class Translator:
         except Exception:
             return False
 
-    # -- 翻译 ------------------------------------------------------------
-    def translate(self, text: str, direction: str, timeout: float = 90.0) -> str:
+    def translate(self, text: str, src: str, tgt: str, timeout: float = 90.0) -> str:
         # 中→韩：完全命中短语表时直接用词典，避免小模型胡编
-        if direction == 'zh2ko':
+        if (src, tgt) == ('zh', 'ko'):
             exact = ZH_FALLBACK.get(text.strip().rstrip('。！!？?'))
             if exact:
                 return exact
-        if direction == 'ko2zh':
-            system, shots = KO2ZH, SHOTS_KO2ZH
-        else:
-            system, shots = ZH2KO, SHOTS_ZH2KO
+        if (src, tgt) == ('en', 'zh'):
+            exact = EN_FALLBACK.get(_norm(text))
+            if exact:
+                return exact
+
+        system, shots = PROMPTS.get((src, tgt), ('', []))
+        if not system:
+            system = f'把下面的{LANGS.get(src, src)}内容翻译成{LANGS.get(tgt, tgt)}，只输出译文。'
+
         messages = [{'role': 'system', 'content': system}]
-        for src, dst in shots:
-            messages.append({'role': 'user', 'content': src})
-            messages.append({'role': 'assistant', 'content': dst})
+        for a, b in shots:
+            messages.append({'role': 'user', 'content': a})
+            messages.append({'role': 'assistant', 'content': b})
         messages.append({'role': 'user', 'content': text})
 
         payload = {
@@ -248,8 +383,8 @@ class Translator:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             out = clean_output(data['choices'][0]['message']['content'])
-            # 中→韩：如果输出里一个韩文字符都没有，说明模型跑偏了，退回短语表
-            if direction == 'zh2ko' and not HANGUL.search(out):
+            # 中→韩：输出里没有韩文，说明跑偏了，退回短语表
+            if (src, tgt) == ('zh', 'ko') and not HANGUL.search(out):
                 alt = self._zh_fallback(text)
                 if alt:
                     out = alt
@@ -274,33 +409,59 @@ class Translator:
 
 # ---------------------------------------------------------------- OCR
 class Ocr:
+    """按语言懒加载多个识别模型；auto 模式先试韩语，再试中日英混合。"""
+
     def __init__(self) -> None:
-        self.engine = None
+        self.engines: dict[str, object] = {}
         self.error = ''
         self._lock = threading.Lock()
 
-    def ensure(self) -> bool:
-        with self._lock:
-            if self.engine is not None:
-                return True
-            try:
-                from rapidocr import RapidOCR, EngineType, ModelType, OCRVersion
+    def _build(self, lang: str):
+        from rapidocr import RapidOCR, EngineType, ModelType, OCRVersion
 
-                self.engine = RapidOCR(params={
-                    'Rec.engine_type': EngineType.ONNXRUNTIME,
-                    'Rec.lang_type': 'korean',
-                    'Rec.model_type': ModelType.MOBILE,
-                    'Rec.ocr_version': OCRVersion.PPOCRV4,
-                })
-                return True
+        if lang == 'ko':
+            params = dict(lang='korean', version=OCRVersion.PPOCRV4)
+        elif lang == 'en':
+            params = dict(lang='en', version=OCRVersion.PPOCRV4)
+        elif lang == 'ja':
+            params = dict(lang='japan', version=OCRVersion.PPOCRV4)
+        else:                      # 中日英混合（自动模式的兜底）
+            params = dict(lang='ch', version=OCRVersion.PPOCRV5)
+
+        return RapidOCR(params={
+            'Rec.engine_type': EngineType.ONNXRUNTIME,
+            'Rec.lang_type': params['lang'],
+            'Rec.model_type': ModelType.MOBILE,
+            'Rec.ocr_version': params['version'],
+        })
+
+    def engine(self, lang: str):
+        with self._lock:
+            if lang in self.engines:
+                return self.engines[lang]
+            try:
+                eng = self._build(lang)
             except Exception as exc:  # noqa: BLE001
                 self.error = str(exc)
-                return False
+                raise RuntimeError(self.error) from exc
+            self.engines[lang] = eng
+            return eng
 
-    def read(self, image) -> str:
-        if not self.ensure():
-            raise RuntimeError(self.error or 'OCR 初始化失败')
+    def warm_up(self) -> None:
+        try:
+            self.engine('ko')
+        except Exception:
+            pass
+
+    def _run(self, image, lang: str) -> str:
         import numpy as np
+
+        eng = self.engine(lang)
+        result = eng(np.array(image.convert('RGB')))
+        txts = getattr(result, 'txts', None) or []
+        return '\n'.join(t.strip() for t in txts if t and t.strip())
+
+    def read(self, image, lang: str = 'auto') -> str:
         from PIL import Image
 
         scale = 1
@@ -315,9 +476,25 @@ class Ocr:
         if scale > 1:
             image = image.resize((image.width * scale, image.height * scale), Image.LANCZOS)
 
-        result = self.engine(np.array(image.convert('RGB')))
-        txts = getattr(result, 'txts', None) or []
-        return '\n'.join(t.strip() for t in txts if t and t.strip())
+        if lang != 'auto':
+            return self._run(image, lang)
+
+        ko_text = ''
+        try:
+            ko_text = self._run(image, 'ko')
+        except Exception:
+            pass
+        # 只看"有没有一个韩文字"不够：日文常被误认成含假韩文的乱码，
+        # 所以要求韩文字符占比足够高才认作韩语。
+        if ko_text and _hangul_ratio(ko_text) >= 0.4:
+            return ko_text
+
+        mixed = ''
+        try:
+            mixed = self._run(image, 'cjk')
+        except Exception:
+            pass
+        return mixed or ko_text
 
 
 # ---------------------------------------------------------------- 区域框选
@@ -368,8 +545,6 @@ class RegionPicker(tk.Toplevel):
 
 # ---------------------------------------------------------------- 全局热键
 class Hotkey(threading.Thread):
-    """用 Win32 RegisterHotKey 注册全局热键，不依赖第三方库。"""
-
     MODS = {'F1': 0x70, 'F2': 0x71, 'F3': 0x72, 'F4': 0x73, 'F5': 0x74,
             'F6': 0x75, 'F7': 0x76, 'F8': 0x77, 'F9': 0x78, 'F10': 0x79}
 
@@ -401,9 +576,9 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.cfg = load_config()
-        self.title('OW 聊天翻译 · 双向')
-        self.geometry('500x620+40+60')
-        self.minsize(420, 480)
+        self.title('OW 聊天翻译 · 韩 / 英 / 日')
+        self.geometry('520x660+40+60')
+        self.minsize(440, 520)
         self.attributes('-topmost', True)
         self.configure(bg='#1b1d22')
 
@@ -411,7 +586,6 @@ class App(tk.Tk):
         self.ocr = Ocr()
         self.events: queue.Queue = queue.Queue()
         self._busy = False
-        self._last_dir = 'ko2zh'
 
         self._build_ui()
         self.after(100, self._drain)
@@ -433,46 +607,61 @@ class App(tk.Tk):
         style.configure('TFrame', background='#1b1d22')
         style.configure('TLabel', background='#1b1d22', foreground='#c9ccd4', font=ui)
         style.configure('TButton', font=ui)
-        style.configure('TRadiobutton', background='#1b1d22', foreground='#c9ccd4', font=ui)
+        style.configure('TCombobox', font=ui)
 
         root = ttk.Frame(self, padding=12)
         root.pack(fill='both', expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(4, weight=1)
-        root.rowconfigure(7, weight=2)
+        root.rowconfigure(5, weight=1)
+        root.rowconfigure(8, weight=2)
 
         self.status = ttk.Label(root, text='初始化…', foreground='#8ab4f8')
         self.status.grid(row=0, column=0, sticky='w')
 
-        dirs = ttk.Frame(root)
-        dirs.grid(row=1, column=0, sticky='w', pady=(8, 0))
-        self.dir_var = tk.StringVar(value=self.cfg.get('direction', 'auto'))
-        for text, val in (('自动', 'auto'), ('韩→中', 'ko2zh'), ('中→韩', 'zh2ko')):
-            ttk.Radiobutton(dirs, text=text, value=val, variable=self.dir_var,
-                            command=self._save_dir).pack(side='left', padx=(0, 8))
+        langs = ttk.Frame(root)
+        langs.grid(row=1, column=0, sticky='w', pady=(8, 0))
 
-        ttk.Label(root, text='韩文 / 中文（Ctrl+V 粘贴截图）').grid(row=3, column=0, sticky='w', pady=(8, 4))
+        ttk.Label(langs, text='源语言').pack(side='left')
+        self.src_var = tk.StringVar(value=LANGS.get(self.cfg.get('src', 'auto'), '自动')
+                                    if self.cfg.get('src') != 'auto' else '自动')
+        self.src_box = ttk.Combobox(langs, textvariable=self.src_var, state='readonly',
+                                    values=[t for t, _ in SRC_CHOICES], width=6)
+        self.src_box.pack(side='left', padx=(6, 14))
+        self.src_box.bind('<<ComboboxSelected>>', lambda e: self._save_langs())
+
+        ttk.Label(langs, text='目标语言').pack(side='left')
+        self.tgt_var = tk.StringVar(value=LANGS.get(self.cfg.get('tgt', 'zh'), '中文'))
+        self.tgt_box = ttk.Combobox(langs, textvariable=self.tgt_var, state='readonly',
+                                    values=[t for t, _ in TGT_CHOICES], width=6)
+        self.tgt_box.pack(side='left', padx=6)
+        self.tgt_box.bind('<<ComboboxSelected>>', lambda e: self._save_langs())
+
+        self.pair_label = ttk.Label(root, text='', foreground='#7d828c')
+        self.pair_label.grid(row=2, column=0, sticky='w', pady=(4, 0))
+        self._refresh_pair()
+
+        ttk.Label(root, text='原文（Ctrl+V 粘贴截图）').grid(row=4, column=0, sticky='w', pady=(8, 4))
 
         self.input = tk.Text(root, height=4, wrap='word', bg='#252830', fg='#e8eaed',
                              insertbackground='#e8eaed', relief='flat',
-                             font=('Malgun Gothic', 12), padx=8, pady=6)
-        self.input.grid(row=4, column=0, sticky='nsew')
+                             font=('Microsoft YaHei UI', 12), padx=8, pady=6)
+        self.input.grid(row=5, column=0, sticky='nsew')
         self.input.bind('<Control-Return>', lambda e: self.do_translate())
 
         bar = ttk.Frame(root)
-        bar.grid(row=5, column=0, sticky='ew', pady=8)
+        bar.grid(row=6, column=0, sticky='ew', pady=8)
         ttk.Button(bar, text='翻译 (Ctrl+Enter)', command=self.do_translate).pack(side='left')
         ttk.Button(bar, text='粘贴截图', command=self.do_paste_image).pack(side='left', padx=6)
         ttk.Button(bar, text='复制译文', command=self.copy_result).pack(side='left')
         ttk.Button(bar, text='清空', command=self.clear).pack(side='right')
 
-        ttk.Label(root, text='译文').grid(row=6, column=0, sticky='w', pady=(4, 4))
+        ttk.Label(root, text='译文').grid(row=7, column=0, sticky='w', pady=(4, 4))
         self.output = tk.Text(root, height=5, wrap='word', bg='#252830', fg='#9fe6a0',
                               relief='flat', font=('Microsoft YaHei UI', 12), padx=8, pady=6)
-        self.output.grid(row=7, column=0, sticky='nsew')
+        self.output.grid(row=8, column=0, sticky='nsew')
 
         zone = ttk.Frame(root)
-        zone.grid(row=8, column=0, sticky='ew', pady=(10, 0))
+        zone.grid(row=9, column=0, sticky='ew', pady=(10, 0))
         ttk.Button(zone, text='框选聊天区域', command=self.pick_region).pack(side='left')
         self.region_label = ttk.Label(zone, text=self._region_text(), foreground='#7d828c')
         self.region_label.pack(side='left', padx=8)
@@ -481,13 +670,34 @@ class App(tk.Tk):
         ttk.Label(
             root,
             text='游戏请用「无边框窗口」；本工具不注入游戏进程，不会被反作弊波及。',
-            foreground='#7d828c', wraplength=460, justify='left',
-        ).grid(row=9, column=0, sticky='w', pady=(8, 0))
+            foreground='#7d828c', wraplength=480, justify='left',
+        ).grid(row=10, column=0, sticky='w', pady=(8, 0))
+
+    # -- 语言 -------------------------------------------------------------
+    def _code(self, label: str, table) -> str:
+        for text, code in table:
+            if text == label:
+                return code
+        return table[0][1]
+
+    def _save_langs(self) -> None:
+        self.cfg['src'] = self._code(self.src_var.get(), SRC_CHOICES)
+        self.cfg['tgt'] = self._code(self.tgt_var.get(), TGT_CHOICES)
+        if self.cfg['tgt'] != 'zh':
+            self.cfg['zh_target'] = self.cfg['tgt']
+        save_config(self.cfg)
+        self._refresh_pair()
+
+    def _refresh_pair(self) -> None:
+        src = self._code(self.src_var.get(), SRC_CHOICES)
+        tgt = self._code(self.tgt_var.get(), TGT_CHOICES)
+        if src == 'auto':
+            hint = f'自动识别 · 外文译中 / 中文译{LANGS.get(self.cfg.get("zh_target", "ko"), "韩语")}'
+        else:
+            hint = f'{LANGS.get(src, src)} → {LANGS.get(tgt, tgt)}'
+        self.pair_label.configure(text=hint)
 
     # -- 状态 -------------------------------------------------------------
-    def log(self, msg: str) -> None:
-        self.events.put(('status', msg))
-
     def _drain(self) -> None:
         try:
             while True:
@@ -518,14 +728,10 @@ class App(tk.Tk):
         r = self.cfg.get('region')
         return '未设置' if not r else f'{r[2] - r[0]}×{r[3] - r[1]}'
 
-    def _save_dir(self) -> None:
-        self.cfg['direction'] = self.dir_var.get()
-        save_config(self.cfg)
-
     # -- 预热 -------------------------------------------------------------
     def _warm_up(self) -> None:
         self.events.put(('status', '正在加载 OCR…'))
-        self.ocr.ensure()
+        self.ocr.warm_up()
         self.events.put(('status', '正在启动本地模型…'))
         if self.translator.ensure_server(lambda m: self.events.put(('status', m))):
             self.events.put(('done', f'就绪 · {self.translator.mode} · 按 {self.cfg.get("hotkey", "F8")} 截图翻译'))
@@ -544,7 +750,7 @@ class App(tk.Tk):
         self.region_label.configure(text=self._region_text())
         self.status.configure(text='区域已保存', foreground='#8ab4f8')
 
-    # -- 热键触发 ---------------------------------------------------------
+    # -- 热键 -------------------------------------------------------------
     def _hotkey_action(self) -> None:
         region = self.cfg.get('region')
         if not region:
@@ -580,37 +786,42 @@ class App(tk.Tk):
         self._run_async(self._job_pipeline, img)
 
     def _job_pipeline(self, img) -> None:
+        src_sel = self._code(self.src_var.get(), SRC_CHOICES)
         self.events.put(('status', '识别中…'))
-        text = self.ocr.read(img)
+        text = self.ocr.read(img, 'auto' if src_sel == 'auto' else src_sel)
         if not text:
             raise RuntimeError('没识别出文字，试着放大截图或换个区域')
         self.events.put(('input', text))
-        self._job_translate(text, self._decide_direction(text))
+        self._job_translate(text, *self._decide_pair(text))
 
     def do_translate(self) -> None:
         text = self.input.get('1.0', 'end').strip()
         if not text:
             self.status.configure(text='先粘贴截图或输入文字', foreground='#ffb74d')
             return
-        self._run_async(self._job_translate, text, self._decide_direction(text))
+        self._run_async(self._job_translate, text, *self._decide_pair(text))
 
-    def _decide_direction(self, text: str) -> str:
-        chosen = self.dir_var.get()
-        if chosen in ('ko2zh', 'zh2ko'):
-            self._last_dir = chosen
-            return chosen
-        direction = 'ko2zh' if HANGUL.search(text) else 'zh2ko'
-        self._last_dir = direction
-        return direction
+    def _decide_pair(self, text: str) -> tuple[str, str]:
+        src_sel = self._code(self.src_var.get(), SRC_CHOICES)
+        tgt_sel = self._code(self.tgt_var.get(), TGT_CHOICES)
+        src = detect_lang(text) if src_sel == 'auto' else src_sel
 
-    def _job_translate(self, text: str, direction: str) -> None:
+        if src == 'zh':
+            tgt = tgt_sel if tgt_sel != 'zh' else self.cfg.get('zh_target', 'ko')
+            if tgt == 'zh':
+                tgt = 'ko'
+        else:
+            tgt = 'zh'
+        return src, tgt
+
+    def _job_translate(self, text: str, src: str, tgt: str) -> None:
         if not self.translator.ensure_server(lambda m: self.events.put(('status', m))):
             raise RuntimeError(self.translator.last_error or '模型未就绪')
-        self.events.put(('status', f'翻译中（{"韩→中" if direction == "ko2zh" else "中→韩"}）…'))
+        self.events.put(('status', f'翻译中（{LANGS.get(src, src)}→{LANGS.get(tgt, tgt)}）…'))
         t0 = time.time()
-        out = self.translator.translate(text, direction)
+        out = self.translator.translate(text, src, tgt)
         self.events.put(('output', out))
-        self.events.put(('done', f'完成 · {time.time() - t0:.1f}s'))
+        self.events.put(('done', f'完成 · {LANGS.get(src, src)}→{LANGS.get(tgt, tgt)} · {time.time() - t0:.1f}s'))
 
     def _run_async(self, fn, *args) -> None:
         if self._busy:
