@@ -70,6 +70,47 @@ def _hangul_ratio(text: str) -> float:
     return len(HANGUL.findall(text)) / total
 
 
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+
+
+def grab_clipboard_image(tk_root=None):
+    """从剪贴板取图片，兼容三种情况：
+    1) 剪贴板里是位图（ImageGrab 直接返回 Image）
+    2) 剪贴板里是图片文件（系统截图工具常放文件路径，返回路径列表）
+    3) 剪贴板里只有一段图片路径文本
+    """
+    from PIL import Image, ImageGrab
+
+    try:
+        data = ImageGrab.grabclipboard()
+    except Exception:
+        data = None
+
+    if data is not None and hasattr(data, 'size'):
+        return data
+
+    if isinstance(data, (list, tuple)):
+        for item in data:
+            p = str(item)
+            if p.lower().endswith(IMAGE_EXTS) and os.path.exists(p):
+                try:
+                    return Image.open(p)
+                except Exception:
+                    pass
+
+    # 文本路径兜底（有些工具只往剪贴板写一行路径）
+    try:
+        text = (tk_root.clipboard_get() if tk_root is not None else '').strip().strip('"')
+    except Exception:
+        text = ''
+    if text.lower().endswith(IMAGE_EXTS) and os.path.exists(text):
+        try:
+            return Image.open(text)
+        except Exception:
+            pass
+    return None
+
+
 # ---------------------------------------------------------------- 提示词
 RULE_TAIL = """
 规则：
@@ -461,6 +502,26 @@ class Ocr:
         txts = getattr(result, 'txts', None) or []
         return '\n'.join(t.strip() for t in txts if t and t.strip())
 
+    @staticmethod
+    def _plausible(text: str, lang: str) -> bool:
+        """识别结果像不像该语言。用来发现"选错模型"导致的乱码。"""
+        if not text.strip():
+            return False
+        if lang == 'ko':
+            return _hangul_ratio(text) >= 0.2
+        if lang == 'ja':
+            return bool(KANA.search(text))
+        if lang == 'en':
+            return bool(LATIN.search(text))
+        return bool(CJK.search(text))
+
+    def _enhanced(self, image):
+        """低对比度/彩色文字的自救：灰度 + 自动对比度。"""
+        from PIL import ImageEnhance, ImageOps
+
+        gray = ImageOps.autocontrast(ImageOps.grayscale(image), cutoff=1)
+        return ImageEnhance.Contrast(gray).enhance(1.8).convert('RGB')
+
     def read(self, image, lang: str = 'auto') -> str:
         from PIL import Image
 
@@ -476,25 +537,35 @@ class Ocr:
         if scale > 1:
             image = image.resize((image.width * scale, image.height * scale), Image.LANCZOS)
 
-        if lang != 'auto':
-            return self._run(image, lang)
+        def safe(img, which):
+            try:
+                return self._run(img, which)
+            except Exception:
+                return ''
 
-        ko_text = ''
-        try:
-            ko_text = self._run(image, 'ko')
-        except Exception:
-            pass
+        if lang != 'auto':
+            primary = safe(image, lang)
+            if self._plausible(primary, lang):
+                return primary
+            # 选了韩语却认出中文/日文/英文 → 说明选错了模型，换混合模型再试
+            mixed = safe(image, 'cjk')
+            if len(mixed.strip()) > len(primary.strip()):
+                return mixed
+            return primary or mixed
+
+        ko_text = safe(image, 'ko')
         # 只看"有没有一个韩文字"不够：日文常被误认成含假韩文的乱码，
         # 所以要求韩文字符占比足够高才认作韩语。
         if ko_text and _hangul_ratio(ko_text) >= 0.4:
             return ko_text
 
-        mixed = ''
-        try:
-            mixed = self._run(image, 'cjk')
-        except Exception:
-            pass
-        return mixed or ko_text
+        mixed = safe(image, 'cjk')
+        if mixed.strip():
+            return mixed
+
+        # 两位模型都没读出东西 → 提高对比度再来一次
+        enhanced = safe(self._enhanced(image), 'cjk')
+        return enhanced or ko_text
 
 
 # ---------------------------------------------------------------- 区域框选
@@ -647,6 +718,8 @@ class App(tk.Tk):
                              font=('Microsoft YaHei UI', 12), padx=8, pady=6)
         self.input.grid(row=5, column=0, sticky='nsew')
         self.input.bind('<Control-Return>', lambda e: self.do_translate())
+        self.input.bind('<Control-v>', self._on_ctrl_v)
+        self.input.bind('<Control-V>', self._on_ctrl_v)
 
         bar = ttk.Frame(root)
         bar.grid(row=6, column=0, sticky='ew', pady=8)
@@ -692,7 +765,7 @@ class App(tk.Tk):
         src = self._code(self.src_var.get(), SRC_CHOICES)
         tgt = self._code(self.tgt_var.get(), TGT_CHOICES)
         if src == 'auto':
-            hint = f'自动识别 · 外文译中 / 中文译{LANGS.get(self.cfg.get("zh_target", "ko"), "韩语")}'
+            hint = '自动识别 · 外文译中 / 中文按目标语言处理'
         else:
             hint = f'{LANGS.get(src, src)} → {LANGS.get(tgt, tgt)}'
         self.pair_label.configure(text=hint)
@@ -773,17 +846,21 @@ class App(tk.Tk):
 
     # -- 主流程 -----------------------------------------------------------
     def do_paste_image(self) -> None:
-        try:
-            from PIL import ImageGrab
-
-            img = ImageGrab.grabclipboard()
-        except Exception as exc:  # noqa: BLE001
-            self.status.configure(text=f'读取剪贴板失败: {exc}', foreground='#ff8a80')
-            return
-        if img is None or not hasattr(img, 'size'):
-            self.status.configure(text='剪贴板里没有图片，先 Win+Shift+S 截图', foreground='#ffb74d')
+        img = grab_clipboard_image(self)
+        if img is None:
+            self.status.configure(
+                text='剪贴板里没有图片：先 Win+Shift+S 截图，再点这里（或在输入框按 Ctrl+V）',
+                foreground='#ffb74d')
             return
         self._run_async(self._job_pipeline, img)
+
+    def _on_ctrl_v(self, event=None):
+        """输入框里的 Ctrl+V：优先当图片处理，其次才是文本粘贴。"""
+        img = grab_clipboard_image(self)
+        if img is not None:
+            self._run_async(self._job_pipeline, img)
+            return 'break'
+        return None
 
     def _job_pipeline(self, img) -> None:
         src_sel = self._code(self.src_var.get(), SRC_CHOICES)
@@ -792,29 +869,46 @@ class App(tk.Tk):
         if not text:
             raise RuntimeError('没识别出文字，试着放大截图或换个区域')
         self.events.put(('input', text))
-        self._job_translate(text, *self._decide_pair(text))
+        self._job_translate(text, *self._decide_pair(text, forced_src=src_sel))
 
     def do_translate(self) -> None:
         text = self.input.get('1.0', 'end').strip()
         if not text:
             self.status.configure(text='先粘贴截图或输入文字', foreground='#ffb74d')
             return
+        # 有些人会把截图路径直接粘进来，这种情况按图片处理
+        maybe_path = text.strip().strip('"')
+        if maybe_path.lower().endswith(IMAGE_EXTS) and os.path.exists(maybe_path):
+            try:
+                from PIL import Image
+
+                img = Image.open(maybe_path)
+                self._run_async(self._job_pipeline, img)
+                return
+            except Exception:
+                pass
         self._run_async(self._job_translate, text, *self._decide_pair(text))
 
-    def _decide_pair(self, text: str) -> tuple[str, str]:
-        src_sel = self._code(self.src_var.get(), SRC_CHOICES)
+    def _decide_pair(self, text: str, forced_src: str | None = None) -> tuple[str, str]:
+        src_sel = forced_src or self._code(self.src_var.get(), SRC_CHOICES)
         tgt_sel = self._code(self.tgt_var.get(), TGT_CHOICES)
+        # 手选了语言但内容和它不符（比如选韩语却识别出中文），以内容为准
+        if src_sel != 'auto' and not Ocr._plausible(text, src_sel):
+            src_sel = 'auto'
         src = detect_lang(text) if src_sel == 'auto' else src_sel
 
         if src == 'zh':
-            tgt = tgt_sel if tgt_sel != 'zh' else self.cfg.get('zh_target', 'ko')
-            if tgt == 'zh':
-                tgt = 'ko'
+            # 目标是中文就原样显示（不再强行翻成外语）；想回话就把目标语言选成韩/英/日
+            tgt = tgt_sel
         else:
             tgt = 'zh'
         return src, tgt
 
     def _job_translate(self, text: str, src: str, tgt: str) -> None:
+        if src == tgt:
+            self.events.put(('output', text))
+            self.events.put(('done', '原文已是中文，无需翻译'))
+            return
         if not self.translator.ensure_server(lambda m: self.events.put(('status', m))):
             raise RuntimeError(self.translator.last_error or '模型未就绪')
         self.events.put(('status', f'翻译中（{LANGS.get(src, src)}→{LANGS.get(tgt, tgt)}）…'))
